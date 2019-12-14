@@ -8,6 +8,7 @@ __version__ = '0.56.0'
 _CMD_USAGE = "python -m memory_profiler script_file.py"
 
 from functools import wraps
+import hashlib
 import inspect
 import linecache
 import logging
@@ -628,15 +629,54 @@ class CodeMap(dict):
             self.add(subcode, toplevel_code=toplevel_code)
 
     def trace(self, code, lineno, prev_lineno):
+        # Memory usage *right now*
         memory = _get_memory(-1, self.backend, include_children=self.include_children,
                              filename=code.co_filename)
-        prev_value = self[code].get(lineno, None)
-        previous_memory = prev_value[1] if prev_value else 0
-        previous_inc = prev_value[0] if prev_value else 0
 
-        prev_line_value = self[code].get(prev_lineno, None) if prev_lineno else None
-        prev_line_memory = prev_line_value[1] if prev_line_value else 0
-        self[code][lineno] = (max(previous_inc, memory-prev_line_memory), max(memory, previous_memory))
+        # Historical memory usage at this line and previous line:
+        prev_value = self[code].get(lineno, None)
+        prev_line_value = self[code].get(prev_lineno, None) if prev_lineno is not None else None
+
+        prev_line_memory = prev_line_value[1] if prev_line_value is not None else 0
+        increment = memory - prev_line_memory
+        increment_pos = increment if increment >= 0 else 0
+
+        if prev_value is None:  # intialize if first pass
+            self[code][lineno] = (
+                increment,      # Highest single increase in memory at this line
+                memory,         # Highest total memory usage at this line
+                increment_pos,  # Lowest single (positive) increase in memory at this line
+                memory,         # Lowest total memory usage at this line
+                increment_pos,  # Cumulative increase in memory (positive-only)
+                increment,      # Cumulative increase in memory (net)
+                0,              # ditto, except after the first pass
+                0,              # ditto, ...
+                1,              # Passes over this line
+            )
+            return
+
+        prev_inc = prev_value[0]
+        prev_memory_val = prev_value[1]
+        prev_lowest_mem = prev_value[2]
+        prev_total_incr = prev_value[3]
+        prev_cum_pos_increment = prev_value[4]
+        prev_cum_net_increment = prev_value[5]
+        prev_cum_pos_increment_post = prev_value[6]
+        prev_cum_net_increment_post = prev_value[7]
+        prev_pass_count = prev_value[8]
+
+        self[code][lineno] = (
+            max(prev_inc, increment),
+            max(prev_memory_val, memory),
+            min(prev_lowest_mem, memory) if prev_lowest_mem > 0 else memory,
+            max(memory, prev_lowest_mem) - prev_lowest_mem,
+            prev_cum_pos_increment + increment_pos,
+            prev_cum_net_increment + increment,
+            prev_cum_pos_increment_post + increment_pos,
+            prev_cum_net_increment_post + increment,
+            prev_pass_count + 1
+        )
+
 
     def items(self):
         """Iterate on the toplevel code blocks."""
@@ -790,14 +830,26 @@ class LineProfiler(object):
         sys.settrace(self._original_trace_function)
 
 
-def show_results(prof, stream=None, precision=1):
+def show_results(prof, stream=None, precision=4):
+    precision = 4
     if stream is None:
         stream = sys.stdout
-    template = '{0:>6} {1:>12} {2:>12}   {3:<}'
+    template = '{0:>6} {1:>12} {2:>12} {3:>12} {4:>12} {5:>12} {6:>12} {7:>12} {8:>12} {9:>9}  {10:<}'
 
     for (filename, lines) in prof.code_map.items():
-        header = template.format('Line #', 'Mem usage', 'Increment',
-                                 'Line Contents')
+        header = template.format(
+            'Line #',
+            '>>Mem Incr.',
+            '>>Mem Total',
+            '<<Mem Total',
+            '<<Total Inc',
+            'Cum Mem Inc',
+            'Net Mem Inc',
+            'Cum Inc >=2',
+            'Net Inc >=2',
+            'Line Passes',
+            'Line Contents',
+        )
 
         stream.write(u'Filename: ' + filename + '\n\n')
         stream.write(header + u'\n')
@@ -806,18 +858,16 @@ def show_results(prof, stream=None, precision=1):
         all_lines = linecache.getlines(filename)
 
         float_format = u'{0}.{1}f'.format(precision + 4, precision)
-        template_mem = u'{0:' + float_format + '} MiB'
+        template_mem = u'{0:' + float_format + '}'
         for (lineno, mem) in lines:
+            formatted_memvals = [u'' for _ in range(9)]
             if mem:
-                inc = mem[0]
-                mem = mem[1]
-                mem = template_mem.format(mem)
-                inc = template_mem.format(inc)
-            else:
-                mem = u''
-                inc = u''
-            tmp = template.format(lineno, mem, inc, all_lines[lineno - 1])
-            stream.write(to_str(tmp))
+                formatted_memvals = [template_mem.format(m) for m in mem[:-1]]  # values of MiB
+                formatted_memvals.append(str(mem[-1]))  # typical decimal
+            formatted_memvals = tuple(formatted_memvals)
+            tmp = template.format(hashlib.blake2b(all_lines[lineno - 1].encode('utf-8'), digest_size=3).hexdigest(), *formatted_memvals, all_lines[lineno - 1])
+#            tmp = template.format(lineno, *formatted_memvals, all_lines[lineno - 1])
+            stream.write(unicode(tmp, 'UTF-8'))
         stream.write(u'\n\n')
 
 
